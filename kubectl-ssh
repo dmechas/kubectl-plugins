@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+#
+# kubectl-ssh: provider-agnostic shell access to Kubernetes nodes and pods.
+#
+# Kept compatible with bash 3.2 (macOS default): no mapfile, no namerefs,
+# no ${var::-1}, and empty arrays are expanded with ${arr[@]+"${arr[@]}"}.
+
+set -euo pipefail
+
+VERSION=2.0.0
+
+MANAGED_LABEL=app.kubernetes.io/managed-by=kubectl-ssh
+KEEP_LABEL=kubectl-ssh/keep
+CONTAINER=shell
+
+image=${KUBECTL_SSH_IMAGE:-busybox:1.37}
+node_namespace=${KUBECTL_SSH_NAMESPACE:-kube-system}
+mode=${KUBECTL_SSH_MODE:-nsenter}
+timeout=${KUBECTL_SSH_TIMEOUT:-120}
+ttl=${KUBECTL_SSH_TTL:-8h}
+
+# Parsed from the command line.
+target=""
+namespace=""
+container=""
+selector=""
+all=false
+keep=false
+debug=false
+quiet=false
+cmd=()
+kargs=() # global kubectl flags (--context, --kubeconfig, ...)
+
+log() { $quiet || printf '%s\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+k() { kubectl ${kargs[@]+"${kargs[@]}"} "$@"; }
+interactive() { [ -t 0 ] && [ -t 2 ]; }
+
+# Converts 90, 90s, 15m, 12h or 2d to seconds.
+to_seconds() {
+  case $1 in
+    *[!0-9smhd]* | "" | [!0-9]*) die "invalid duration '$1' (use e.g. 300, 30m, 12h)" ;;
+    *s) echo "${1%s}" ;;
+    *m) echo $((${1%m} * 60)) ;;
+    *h) echo $((${1%h} * 3600)) ;;
+    *d) echo $((${1%d} * 86400)) ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# The local TERM, forwarded because kubectl exec does not (clear, top, vi).
+term_value() {
+  case ${TERM:-} in '' | *[!A-Za-z0-9._+-]*) echo xterm ;; *) echo "$TERM" ;; esac
+}
+
+# Interactive shell snippet: prefer bash, fall back to ash/sh.
+shell_snippet() {
+  # shellcheck disable=SC2016 # $s expands remotely
+  printf 'export TERM=%s; for s in bash ash sh; do command -v $s >/dev/null 2>&1 && exec $s %s; done' \
+    "$(term_value)" "${1:-}"
+}
+
+# Shell inside the helper container, for hosts without a POSIX shell. It sees
+# the host's processes and network, has the host's filesystem at /host, and
+# defines "host CMD..." to run a host binary in the host's namespaces.
+helper_shell_snippet() {
+  # shellcheck disable=SC2016 # expands remotely
+  printf '%s\n' "export TERM=$(term_value)" \
+    "cat > /tmp/.kubectl-ssh-rc <<'RC'" \
+    'host() { nsenter -t 1 -m -u -i -n -p -- "$@"; }' \
+    "PS1='[helper@$1] \w # '" \
+    'RC' \
+    'cd /host && ENV=/tmp/.kubectl-ssh-rc exec sh -i'
+}
+
+# Sets the caller's "flags": -i always (so piping into a remote command
+# works), -t only when attached to a terminal.
+set_exec_flags() {
+  flags=(-i)
+  if [ -t 0 ] && [ -t 1 ]; then flags+=(-t); fi
+}
+
+# choose WHAT ITEM... -- prints the single item, or lets the user pick one.
+choose() {
+  local what=$1 choice
+  shift
+  [ $# -gt 0 ] || die "no ${what}s found"
+  if [ $# -eq 1 ]; then
+    log "Only one $what found, using $1"
+    printf '%s\n' "$1"
+    return
+  fi
+  if ! interactive; then
+    printf '%s must be specified. Choose one of:\n' "$what" >&2
+    printf '  %s\n' "$@" >&2
+    exit 1
+  fi
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "$@" | fzf --height=40% --reverse --prompt="$what> " || exit 130
+  else
+    PS3="Select $what: "
+    select choice in "$@"; do
+      if [ -n "$choice" ]; then printf '%s\n' "$choice"; return; fi
+    done
+    exit 130
+  fi
+}
+
+# --------------------------------------------------------------------------
+# node
+# --------------------------------------------------------------------------
+
+node_manifest() {
+  local node=$1 seconds=$2
+  cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: ssh-node-
+  labels:
+    ${MANAGED_LABEL%%=*}: ${MANAGED_LABEL#*=}
+    $KEEP_LABEL: "$keep"
+  annotations:
+    kubectl-ssh/node: "$node"
+spec:
+  nodeName: "$node"
+  hostPID: true
+  hostIPC: true
+  hostNetwork: true
+  restartPolicy: Never
+  # Safety net: the pod removes itself even if this script is killed.
+  activeDeadlineSeconds: $seconds
+  terminationGracePeriodSeconds: 1
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  tolerations:
+  - operator: Exists
+  containers:
+  - name: $CONTAINER
+    image: "$image"
+    imagePullPolicy: IfNotPresent
+    command: ["sleep", "$seconds"]
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: host
+      mountPath: /host
+  volumes:
+  - name: host
+    hostPath:
+      path: /
+EOF
+}
+
+wait_running() {
+  local ns=$1 pod=$2 deadline status phase reason
+  deadline=$(($(date +%s) + timeout))
+  log "Waiting for $pod to start..."
+  while :; do
+    status=$(k get -n "$ns" "$pod" -o \
+      jsonpath='{.status.phase} {.status.containerStatuses[0].state.waiting.reason}{.status.reason}' \
+      2>/dev/null || true)
+    read -r phase reason <<<"$status" || true
+    case ${phase:-} in
+      Running) return 0 ;;
+      Failed | Succeeded) die "$pod terminated before it was ready (${reason:-$phase})" ;;
+    esac
+    case ${reason:-} in
+      ImagePullBackOff | InvalidImageName | CreateContainerConfigError | CreateContainerError | RunContainerError)
+        die "$pod failed to start: $reason (image: $image). Run: kubectl describe -n $ns $pod" ;;
+    esac
+    [ "$(date +%s)" -lt "$deadline" ] ||
+      die "timed out after ${timeout}s waiting for $pod (${reason:-${phase:-unknown}})"
+    sleep 1
+  done
+}
+
+# host_has_shell NS POD PREFIX... -- whether the host's sh really is a POSIX
+# shell. Bottlerocket (e.g. EKS Auto Mode) has none.
+host_has_shell() {
+  local ns=$1 pod=$2
+  shift 2
+  # shellcheck disable=SC2016 # evaluated by the host's sh
+  [ "$(k exec -n "$ns" "$pod" -c "$CONTAINER" -- "$@" sh -c 'echo $((40 + 2))' \
+    2>/dev/null </dev/null)" = 42 ]
+}
+
+# Runs the command on one node, in a subshell so each node gets its own trap.
+node_session() (
+  local node=$1 ns=$node_namespace os pod="" seconds flags=() prefix=() run=()
+
+  os=$(k get node "$node" -o jsonpath='{.metadata.labels.kubernetes\.io/os}') ||
+    die "cannot get node '$node'"
+  [ "$os" != windows ] || die "node '$node' runs Windows, which is not supported"
+
+  case $mode in
+    nsenter) prefix=(nsenter -t 1 -m -u -i -n -p --) ;;
+    chroot) prefix=(chroot /host) ;;
+    *) die "invalid mode '$mode' (expected nsenter or chroot)" ;;
+  esac
+
+  # Reuse a pod left behind with --keep, if it runs the same image.
+  pod=$(k get pods -n "$ns" -l "$MANAGED_LABEL,$KEEP_LABEL=true" \
+    --field-selector "spec.nodeName=$node,status.phase=Running" \
+    -o jsonpath='{range .items[*]}{.metadata.name} {.spec.containers[0].image}{"\n"}{end}' 2>/dev/null |
+    awk -v img="$image" '$2 == img { print "pod/" $1; exit }') || true
+
+  if [ -n "$pod" ]; then
+    log "Reusing $pod on node $node"
+  else
+    seconds=$(to_seconds "$ttl")
+    pod=$(node_manifest "$node" "$seconds" | k create -n "$ns" -o name -f -) ||
+      die "could not create the pod in namespace '$ns'. It must allow privileged pods (Pod Security 'privileged' level); pick another one with -n"
+    # shellcheck disable=SC2064
+    trap "k delete -n '$ns' '$pod' --wait=false >/dev/null 2>&1 || true" EXIT
+    trap 'exit 130' INT TERM HUP
+    log "Created $pod on node $node"
+    wait_running "$ns" "$pod"
+    if $keep; then
+      trap - EXIT # only once it started, so a broken pod is never kept
+      log "Keeping $pod; later sessions reuse it. Remove with: kubectl ssh cleanup"
+    fi
+  fi
+
+  if [ ${#cmd[@]} -gt 1 ]; then
+    run=("${prefix[@]}" "${cmd[@]}") # no shell needed
+  elif host_has_shell "$ns" "$pod" "${prefix[@]}"; then
+    if [ ${#cmd[@]} -eq 0 ]; then
+      run=("${prefix[@]}" sh -c "$(shell_snippet -l)")
+    else
+      run=("${prefix[@]}" sh -c "${cmd[0]}") # a single argument may use pipes, globs, ...
+    fi
+  elif [ ${#cmd[@]} -eq 0 ]; then
+    # E.g. Bottlerocket (EKS Auto Mode): the host has no usable POSIX shell.
+    log "Node $node has no POSIX shell (Bottlerocket?). Opening a shell in the helper"
+    log "container: host filesystem at /host, host processes and network visible."
+    log "Run host binaries with: host <command>   (e.g. host journalctl -u kubelet)"
+    run=(sh -c "$(helper_shell_snippet "$node")")
+  else
+    log "Node $node has no POSIX shell; running the command in the helper container"
+    log "(host filesystem at /host). Pass a host binary as separate arguments to run"
+    log "it on the host instead: kubectl ssh node $node -- journalctl -u kubelet"
+    run=(sh -c "${cmd[0]}")
+  fi
+
+  if $all; then
+    exec </dev/null
+  else
+    set_exec_flags
+  fi
+  k exec ${flags[@]+"${flags[@]}"} -n "$ns" "$pod" -c "$CONTAINER" -- "${run[@]}"
+)
+
+ssh_node() {
+  local nodes
+  [ -z "$container" ] || die "--container is only valid for pods"
+  ! $debug || die "--debug is only valid for pods"
+  [ -z "$namespace" ] || node_namespace=$namespace
+  to_seconds "$ttl" >/dev/null
+  case $timeout in '' | *[!0-9]*) die "invalid --timeout '$timeout' (seconds)" ;; esac
+
+  if $all && [ -n "$target" ]; then
+    # "--all 'uptime'": with --all there is no node name, so it is the command.
+    cmd=("$target" ${cmd[@]+"${cmd[@]}"})
+    target=""
+  fi
+  if [ -n "$target" ]; then
+    [ -z "$selector" ] || die "give either a node name or --selector, not both"
+    node_session "$target"
+    return
+  fi
+
+  nodes=$(k get nodes ${selector:+-l "$selector"} \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+
+  if $all; then
+    [ ${#cmd[@]} -gt 0 ] || die "--all requires a command, e.g. kubectl ssh node --all -- uptime"
+    [ -n "$nodes" ] || die "no nodes found"
+    local node rc=0
+    for node in $nodes; do
+      $quiet || printf '==> %s <==\n' "$node"
+      node_session "$node" || rc=$?
+    done
+    return $rc
+  fi
+
+  # shellcheck disable=SC2086 # node names never contain whitespace
+  target=$(choose node $nodes)
+  node_session "$target"
+}
+
+# --------------------------------------------------------------------------
+# pod
+# --------------------------------------------------------------------------
+
+ssh_pod() {
+  local pods pod probe ns_args=() flags=() run=()
+  ! $all || die "--all is only valid for nodes"
+  ! $keep || die "--keep is only valid for nodes"
+  [ -n "$namespace" ] && ns_args=(-n "$namespace")
+
+  if [ -z "$target" ]; then
+    pods=$(k get pods ${ns_args[@]+"${ns_args[@]}"} ${selector:+-l "$selector"} \
+      --field-selector=status.phase=Running \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+    # shellcheck disable=SC2086 # pod names never contain whitespace
+    target=$(choose pod $pods)
+  fi
+
+  if [ ${#cmd[@]} -eq 0 ]; then
+    run=(sh -c "$(shell_snippet)")
+  elif [ ${#cmd[@]} -eq 1 ]; then
+    run=(sh -c "${cmd[0]}")
+  else
+    run=("${cmd[@]}")
+  fi
+  set_exec_flags
+
+  if $debug; then
+    # Ephemeral container sharing the target's process namespace: works for
+    # distroless images that have no shell at all.
+    case $target in */*) [ "${target%%/*}" = pod ] || die "--debug needs a pod, not '$target'" ;; esac
+    pod=${target#pod/}
+    [ -n "$container" ] || container=$(k get pod ${ns_args[@]+"${ns_args[@]}"} "$pod" \
+      -o jsonpath='{.spec.containers[0].name}')
+    log "Starting debug container ($image) targeting container '$container' of pod $pod."
+    log "The target's filesystem is available at /proc/1/root"
+    k debug ${flags[@]+"${flags[@]}"} ${ns_args[@]+"${ns_args[@]}"} "$pod" \
+      --image="$image" --target="$container" --profile=general -- "${run[@]}"
+    return
+  fi
+
+  if [ ${#cmd[@]} -eq 0 ]; then
+    # Detect images without a shell up front; other errors surface below.
+    probe=$(k exec ${ns_args[@]+"${ns_args[@]}"} "$target" ${container:+-c "$container"} \
+      -- sh -c : 2>&1 >/dev/null) || true
+    case $probe in
+      *'"sh": executable file not found'* | *'"sh": stat'*'no such file'*)
+        die "the container has no shell (distroless image?). Try: kubectl ssh pod ${target#pod/} --debug${namespace:+ -n $namespace}" ;;
+    esac
+  fi
+  k exec ${flags[@]+"${flags[@]}"} ${ns_args[@]+"${ns_args[@]}"} "$target" \
+    ${container:+-c "$container"} -- "${run[@]}"
+}
+
+# --------------------------------------------------------------------------
+# list / cleanup
+# --------------------------------------------------------------------------
+
+scope_args() {
+  if [ -n "$namespace" ]; then printf '%s\n' -n "$namespace"; else printf '%s\n' -A; fi
+}
+
+ssh_list() {
+  local scope=()
+  while IFS= read -r f; do scope+=("$f"); done < <(scope_args)
+  k get pods "${scope[@]}" -l "$MANAGED_LABEL" -o \
+    custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName,KEEP:.metadata.labels.kubectl-ssh/keep,STATUS:.status.phase,CREATED:.metadata.creationTimestamp'
+}
+
+ssh_cleanup() {
+  local scope=()
+  while IFS= read -r f; do scope+=("$f"); done < <(scope_args)
+  k delete pods "${scope[@]}" -l "$MANAGED_LABEL" --wait=false
+}
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+Provider-agnostic way of opening a shell on a Kubernetes node or pod.
+
+Node access works without an SSH server or node credentials, the same way on
+any cluster (kind, minikube, Docker Desktop, GKE, EKS, AKS, bare metal, ...).
+It starts a short-lived privileged pod on the node and enters the host's
+namespaces. You need permission to create privileged pods.
+
+Usage:
+  kubectl ssh node [NODE] [flags] [-- COMMAND [ARGS...]]
+  kubectl ssh node/NODE    [flags] [-- COMMAND [ARGS...]]
+  kubectl ssh pod  [POD]   [flags] [-- COMMAND [ARGS...]]
+  kubectl ssh TYPE/NAME    [flags] [-- COMMAND [ARGS...]]   (pod/x, deploy/x, sts/x, ...)
+  kubectl ssh list    [-n NAMESPACE]    list pods created by this plugin
+  kubectl ssh cleanup [-n NAMESPACE]    delete pods created by this plugin
+
+When NODE or POD is omitted, you pick one interactively (with fzf if it is
+installed). A single-argument COMMAND runs through 'sh -c', so pipes work;
+several arguments are run as-is. The '--' is optional.
+
+Examples:
+  kubectl ssh node                                # single-node cluster, or pick one
+  kubectl ssh node worker-1
+  kubectl ssh node worker-1 -- journalctl -u kubelet -n 50
+  kubectl ssh node worker-1 'ps aux | grep containerd'
+  kubectl ssh node worker-1 -- cat /etc/kubernetes/kubelet.conf > kubelet.conf
+  kubectl ssh node --all -- uptime                # run on every node
+  kubectl ssh node -l node-role.kubernetes.io/worker= --all -- df -h /
+  kubectl ssh node worker-1 --keep                # keep the pod for fast reconnects
+  kubectl ssh pod my-pod -n my-ns -c app
+  kubectl ssh deploy/api -n prod -- env
+  kubectl ssh pod distroless-pod --debug          # ephemeral debug container
+
+Flags:
+  -n, --namespace NS   pod mode: namespace of the pod.
+                       node mode: namespace for the helper pod (default kube-system).
+  -c, --container C    pod mode: container to enter.
+  -l, --selector SEL   label selector to filter the nodes/pods to choose from.
+      --all            node mode: run COMMAND on every (selected) node.
+      --image IMG      helper image for nodes and --debug (default busybox:1.37).
+      --mode MODE      node mode: 'nsenter' (default) enters the host's mount, PID,
+                       network, IPC and UTS namespaces, so systemctl, ps and
+                       journalctl see the real host. 'chroot' only changes root.
+      --keep           node mode: keep the helper pod; later sessions reuse it.
+      --ttl DURATION   node mode: helper pod lifetime (default 8h).
+      --timeout SECS   seconds to wait for the helper pod to start (default 120).
+      --debug          pod mode: attach an ephemeral debug container instead of
+                       exec (for images without a shell). Ephemeral containers
+                       cannot be removed; they stay until the pod is deleted.
+  -q, --quiet          only print errors.
+  -h, --help           show this help.
+      --version        show the version.
+
+  --context, --kubeconfig, --cluster, --user, --as, --as-group, -s/--server,
+  --token, --request-timeout, --insecure-skip-tls-verify are passed to kubectl.
+
+Environment:
+  KUBECTL_SSH_IMAGE, KUBECTL_SSH_NAMESPACE, KUBECTL_SSH_MODE,
+  KUBECTL_SSH_TIMEOUT, KUBECTL_SSH_TTL set the defaults of the matching flags.
+EOF
+}
+
+need_value() { [ $# -ge 2 ] || die "flag $1 needs a value"; }
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --) shift; cmd=("$@"); return ;;
+      -h | --help) usage; exit 0 ;;
+      -q | --quiet) quiet=true; shift ;;
+      --all) all=true; shift ;;
+      --keep) keep=true; shift ;;
+      --debug) debug=true; shift ;;
+      -n | --namespace | -c | --container | -l | --selector | --image | --mode | --ttl | --timeout)
+        need_value "$@"
+        case $1 in
+          -n | --namespace) namespace=$2 ;;
+          -c | --container) container=$2 ;;
+          -l | --selector) selector=$2 ;;
+          --image) image=$2 ;;
+          --mode) mode=$2 ;;
+          --ttl) ttl=$2 ;;
+          --timeout) timeout=$2 ;;
+        esac
+        shift 2 ;;
+      --namespace=* | --container=* | --selector=* | --image=* | --mode=* | --ttl=* | --timeout=*)
+        set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
+      --context | --kubeconfig | --cluster | --user | --as | --as-group | -s | --server | --token | --request-timeout)
+        need_value "$@"; kargs+=("$1" "$2"); shift 2 ;;
+      --context=* | --kubeconfig=* | --cluster=* | --user=* | --as=* | --as-group=* | --server=* | \
+        --token=* | --request-timeout=* | --insecure-skip-tls-verify | --insecure-skip-tls-verify=*)
+        kargs+=("$1"); shift ;;
+      -*) die "unknown flag '$1'. See 'kubectl ssh --help'" ;;
+      *)
+        if [ -z "$target" ]; then
+          target=$1
+          shift
+        else
+          cmd=("$@") # everything after the target is the command
+          return
+        fi ;;
+    esac
+  done
+}
+
+main() {
+  [ $# -gt 0 ] || { usage >&2; exit 1; }
+  local sub=$1
+  shift
+  case $sub in
+    -h | --help | help) usage ;;
+    --version | version) echo "kubectl-ssh $VERSION" ;;
+    node | nodes | no) parse_args "$@"; ssh_node ;;
+    node/* | nodes/*) target=${sub#*/}; parse_args "$@"; ssh_node ;;
+    pod | pods | po) parse_args "$@"; ssh_pod ;;
+    */*) target=$sub; parse_args "$@"; ssh_pod ;;
+    list | ls) parse_args "$@"; ssh_list ;;
+    cleanup) parse_args "$@"; ssh_cleanup ;;
+    *) die "unknown command '$sub'. See 'kubectl ssh --help'" ;;
+  esac
+}
+
+main "$@"
